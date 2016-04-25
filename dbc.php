@@ -1,7 +1,7 @@
 <?php
 class Foo {
 
-	<<pre($arg > 10)>>
+	<<pre($arg < 10)>>
 	public function thing($arg) {
 		return $arg;
 	}

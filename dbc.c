@@ -34,9 +34,13 @@ ZEND_DECLARE_MODULE_GLOBALS(dbc)
 
 zend_extension zend_extension_entry;
 
+typedef void (*zend_execute_ex_f)(zend_execute_data *);
+
+zend_execute_ex_f zend_execute_ex_function;
+
 static void php_dbc_destroy_contract(zval *zv) {
-	//destroy_op_array((zend_op_array*)Z_PTR_P(zv));
-	//zend_arena_release(&CG(arena), Z_PTR_P(zv));
+	destroy_op_array((zend_op_array*)Z_PTR_P(zv));
+	zend_arena_release(&CG(arena), Z_PTR_P(zv));
 }
 
 static void php_dbc_recv_args(zend_op_array *contract, zend_op_array *active) {
@@ -82,10 +86,29 @@ static zend_op_array* php_dbc_create_contract(zend_op_array *active, zend_ast *a
 
 	contract->vars = 
 		(zend_string**) ecalloc(sizeof(zend_string*), active->last_var);
+	contract->last_var = active->last_var;
 	memcpy(contract->vars, active->vars, sizeof(zend_string*) * active->last_var);
 
 	contract->literals = (zval*) ecalloc(sizeof(zval), active->last_literal);
+	contract->last_literal = active->last_literal;
 	memcpy(contract->literals, active->vars, sizeof(zval) * active->last_literal);
+
+	contract->num_args = active->num_args;
+	contract->arg_info = (zend_arg_info*) ecalloc(sizeof(zend_arg_info), active->num_args);
+	memcpy(contract->arg_info, active->arg_info, sizeof(zend_arg_info) * active->num_args);
+	{
+		uint32_t i;
+		
+		for (i = 0; i < contract->num_args; i++) {
+			if (contract->arg_info[i].class_name) {
+				zend_string_addref(contract->arg_info[i].class_name);
+			}
+
+			if (contract->arg_info[i].name) {
+				zend_string_addref(contract->arg_info[i].name);
+			}
+		}
+	}
 
 	contract->cache_size = active->cache_size;
 	contract->run_time_cache = (void*) ecalloc(sizeof(void*), contract->cache_size);
@@ -133,75 +156,67 @@ static inline void php_dbc_compile(zend_op_array *ops) {
 	}
 }
 
-static inline void php_dbc_fcall_enter(zend_op_array *unused) {
-	zend_execute_data *frame = EG(current_execute_data);
-	zend_execute_data *call = frame->call;
+static inline void php_dbc_execute(zend_execute_data *execute_data) {
+	zend_function *func = EX(func);
 
-	if (!call || !call->func || 
-		call->func->type != ZEND_USER_FUNCTION || 
-		!call->func->op_array.attributes) {
-		return;
+	if (func) {
+		zend_op_array *contract = zend_hash_index_find_ptr(&DBC(contracts), (zend_long) func);
+
+		if (contract) {
+			zval closure;
+
+			zend_create_closure(
+				&closure, contract, 
+				func->common.scope, func->common.scope, Z_OBJ(EX(This)));
+
+			if (Z_TYPE(closure) == IS_OBJECT) {
+				zend_fcall_info fci = empty_fcall_info;
+				zend_fcall_info_cache fcc = empty_fcall_info_cache;
+				zval rv;
+				char *errstr = NULL;
+
+				if (zend_fcall_info_init(&closure, 0, &fci, &fcc, NULL, &errstr) != SUCCESS) {
+					zval_ptr_dtor(&closure);
+					return;
+				}
+
+				if (zend_fcall_info_argp(&fci, EX_NUM_ARGS(), EX_VAR_NUM(0)) != SUCCESS) {
+					zval_ptr_dtor(&closure);
+					return;
+				}
+
+				fci.retval = &rv;
+
+				if (zend_call_function(&fci, &fcc) != SUCCESS) {
+					zval_ptr_dtor(&closure);
+					return;
+				}
+
+				if (!zend_is_true(&rv)) {
+					zval *ast = zend_hash_str_find(func->op_array.attributes, ZEND_STRL("pre"));
+
+					zend_string *expr = 
+						zend_ast_export("pre(", Z_ASTVAL_P(ast), ")");
+				
+					zend_throw_exception_ex(spl_ce_RuntimeException, 0, 
+						"Pre condition failed %s", ZSTR_VAL(expr));
+				
+					zend_string_release(expr);
+				}
+
+				zend_fcall_info_args_clear(&fci, 1);
+				zval_ptr_dtor(&rv);
+			}
+
+			zval_ptr_dtor(&closure);
+		}
 	}
 
-	{
-		zend_op_array *contract = zend_hash_index_find_ptr(&DBC(contracts), (zend_long) call->func);
-		zval closure;
-
-		if (!contract) {
-			return;
-		}
-
-		zend_create_closure(
-			&closure, contract, 
-			call->func->common.scope, call->func->common.scope, Z_OBJ(call->This));
-
-		if (Z_TYPE(closure) == IS_OBJECT) {
-			zend_fcall_info fci = empty_fcall_info;
-			zend_fcall_info_cache fcc = empty_fcall_info_cache;
-			zval rv;
-			char *errstr = NULL;
-
-			if (zend_fcall_info_init(&closure, 0, &fci, &fcc, NULL, &errstr) != SUCCESS) {
-				zval_ptr_dtor(&closure);
-				return;
-			}
-
-			php_var_dump(ZEND_CALL_ARG(call, 1));			
-
-			if (zend_fcall_info_argp(&fci, ZEND_CALL_NUM_ARGS(call), ZEND_CALL_ARG(call, 1)) != SUCCESS) {
-				zval_ptr_dtor(&closure);
-				return;
-			}
-
-			fci.retval = &rv;
-
-			if (zend_call_function(&fci, &fcc) != SUCCESS) {
-				zval_ptr_dtor(&closure);
-				return;
-			}
-
-			if (!zend_is_true(&rv)) {
-				zval *ast = zend_hash_str_find(call->func->op_array.attributes, ZEND_STRL("pre"));
-
-				zend_string *expr = 
-					zend_ast_export("pre(", Z_ASTVAL_P(ast), ")");
-				
-				zend_throw_exception_ex(spl_ce_RuntimeException, 0, 
-					"Pre condition failed %s", ZSTR_VAL(expr));
-				
-				zend_string_release(expr);
-			}
-
-			zend_fcall_info_args_clear(&fci, 1);
-			zval_ptr_dtor(&rv);
-		}
-
-		zval_ptr_dtor(&closure);
+	if (zend_execute_ex_function) {
+		zend_execute_ex_function(execute_data);
+	} else {
+		execute_ex(execute_data);
 	}
-}
-
-static inline void php_dbc_fcall_leave(zend_op_array *unused) {
-	
 }
 
 /* {{{ PHP_INI
@@ -233,6 +248,8 @@ PHP_MINIT_FUNCTION(dbc)
 	}
 
 	zend_register_extension(&zend_extension_entry, NULL);
+	zend_execute_ex_function = zend_execute_ex;
+	zend_execute_ex = php_dbc_execute;
 
 	return SUCCESS;
 }
@@ -243,6 +260,8 @@ PHP_MINIT_FUNCTION(dbc)
 PHP_MSHUTDOWN_FUNCTION(dbc)
 {
 	UNREGISTER_INI_ENTRIES();
+	
+	zend_execute_ex = zend_execute_ex_function;
 
 	return SUCCESS;
 }
@@ -321,8 +340,8 @@ ZEND_EXT_API zend_extension zend_extension_entry = {
 	NULL,            /* message_handler_func_t */
 	php_dbc_compile, /* op_array_handler_func_t */
 	NULL, 			 /* statement_handler_func_t */
-	php_dbc_fcall_enter, /* fcall_begin_handler_func_t */
-	php_dbc_fcall_leave, /* fcall_end_handler_func_t */
+	NULL, 			  /* fcall_begin_handler_func_t */
+	NULL, 		     /* fcall_end_handler_func_t */
 	NULL,      		 /* op_array_ctor_func_t */
 	NULL,      		 /* op_array_dtor_func_t */
 	STANDARD_ZEND_EXTENSION_PROPERTIES
