@@ -1,0 +1,13 @@
+// $Id$
+// vim:ft=javascript
+
+// If your extension references something external, use ARG_WITH
+// ARG_WITH("dbc", "for dbc support", "no");
+
+// Otherwise, use ARG_ENABLE
+// ARG_ENABLE("dbc", "enable dbc support", "no");
+
+if (PHP_DBC != "no") {
+	EXTENSION("dbc", "dbc.c", PHP_EXTNAME_SHARED, "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+}
+
